@@ -695,6 +695,126 @@ class TestReasoningStreaming:
         assert response.choices[0].message.content == "The answer is 42"
 
 
+class TestGemmaRawMarkupStreaming:
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_raw_gemma_tool_markup_is_parsed_after_stream(self, mock_close, mock_create):
+        from run_agent import AIAgent
+
+        chunks = [
+            _make_stream_chunk(
+                content=(
+                    "I will create the directory ~/test for you.\n"
+                    '<|tool_call>call:terminal{command:<|"|>mkdir -p ~/test<|"|>}<tool_call|>'
+                )
+            ),
+            _make_stream_chunk(finish_reason="stop"),
+        ]
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert response.choices[0].message.content == "I will create the directory ~/test for you."
+        tool_calls = response.choices[0].message.tool_calls
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "terminal"
+        assert json.loads(tool_calls[0].function.arguments) == {"command": "mkdir -p ~/test"}
+        assert response.choices[0].finish_reason == "tool_calls"
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_raw_gemma_tool_markup_is_suppressed_from_stream_callback(self, mock_close, mock_create):
+        from run_agent import AIAgent
+
+        chunks = [
+            _make_stream_chunk(
+                content=(
+                    "I will create the directory ~/test for you.\n"
+                    '<|tool_call>call:terminal{command:<|"|>mkdir -p ~/test<|"|>}<tool_call|>'
+                )
+            ),
+            _make_stream_chunk(finish_reason="stop"),
+        ]
+
+        deltas = []
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            stream_delta_callback=lambda t: deltas.append(t),
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        agent._interruptible_streaming_api_call({})
+
+        assert deltas == ["I will create the directory ~/test for you.\n"]
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_inline_gemma_fallback_handles_missing_parser_module(self, mock_close, mock_create):
+        import builtins
+
+        from run_agent import AIAgent
+
+        chunks = [
+            _make_stream_chunk(
+                content=(
+                    "I will create the directory ~/test for you.\n"
+                    '<|tool_call>call:terminal{command:<|"|>mkdir -p ~/test<|"|>}<tool_call|>'
+                )
+            ),
+            _make_stream_chunk(finish_reason="stop"),
+        ]
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        real_import = builtins.__import__
+
+        def flaky_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "environments.tool_call_parsers":
+                raise ModuleNotFoundError("simulated import path mismatch")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with patch("builtins.__import__", side_effect=flaky_import):
+            response = agent._interruptible_streaming_api_call({})
+
+        tool_calls = response.choices[0].message.tool_calls
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "terminal"
+        assert json.loads(tool_calls[0].function.arguments) == {"command": "mkdir -p ~/test"}
+
+
 # ── Test: _has_stream_consumers ──────────────────────────────────────────
 
 

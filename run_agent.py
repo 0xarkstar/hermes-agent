@@ -21,6 +21,7 @@ Usage:
 """
 
 import asyncio
+import ast
 import base64
 import concurrent.futures
 import copy
@@ -251,6 +252,185 @@ _DESTRUCTIVE_PATTERNS = re.compile(
 )
 # Output redirects that overwrite files (> but not >>)
 _REDIRECT_OVERWRITE = re.compile(r'[^>]>[^>]|^>[^>]')
+
+# Raw tool-call start markers used by OpenAI-compatible providers that stream
+# tool markup inside assistant content instead of structured delta.tool_calls.
+_RAW_TOOL_CALL_START_MARKERS = (
+    "<|tool_call>",
+    "<tool_call>",
+    "<longcat_tool_call>",
+    "[TOOL_CALLS]",
+    "<｜tool▁calls▁begin｜>",
+    "<|tool_calls_section_begin|>",
+    "<|tool_call_section_begin|>",
+)
+
+
+def _contains_raw_tool_markup(text: str) -> bool:
+    """Return True when text includes known raw tool-call delimiters."""
+    if not text:
+        return False
+    return any(marker in text for marker in _RAW_TOOL_CALL_START_MARKERS)
+
+
+def _split_visible_stream_delta(
+    delta_text: str, carry: str = ""
+) -> tuple[str, str, bool]:
+    """Split streamed delta at the first raw tool-call marker."""
+    text = carry + delta_text
+
+    earliest = None
+    for marker in _RAW_TOOL_CALL_START_MARKERS:
+        idx = text.find(marker)
+        if idx != -1 and (earliest is None or idx < earliest):
+            earliest = idx
+
+    if earliest is not None:
+        return text[:earliest], "", True
+
+    longest_prefix_suffix = ""
+    for marker in _RAW_TOOL_CALL_START_MARKERS:
+        max_len = min(len(text), len(marker) - 1)
+        for prefix_len in range(max_len, 0, -1):
+            if text.endswith(marker[:prefix_len]):
+                if prefix_len > len(longest_prefix_suffix):
+                    longest_prefix_suffix = text[-prefix_len:]
+                break
+
+    if longest_prefix_suffix:
+        return text[: -len(longest_prefix_suffix)], longest_prefix_suffix, False
+
+    return text, "", False
+
+
+def _candidate_raw_tool_parser_names(
+    text: str, preferred: Optional[str] = None
+) -> list[str]:
+    """Return likely raw tool parsers for the given content."""
+    candidates: list[str] = []
+
+    def add(name: str) -> None:
+        if name and name not in candidates:
+            candidates.append(name)
+
+    if preferred:
+        add(preferred)
+
+    if "<|tool_call>" in text:
+        add("gemma4")
+
+    if "<|tool_calls_section_begin|>" in text or "<|tool_call_section_begin|>" in text:
+        add("kimi_k2")
+
+    if "<｜tool▁calls▁begin｜>" in text:
+        add("deepseek_v3_1")
+        add("deepseek_v3")
+
+    if "[TOOL_CALLS]" in text:
+        add("mistral")
+
+    if "<longcat_tool_call>" in text:
+        add("longcat")
+
+    if "<tool_call>" in text:
+        if "<function=" in text:
+            add("qwen3_coder")
+        if "<arg_key>" in text and "<arg_value>" in text:
+            add("glm47")
+            add("glm45")
+        add("hermes")
+        add("qwen")
+
+    if "<|python_tag|>" in text:
+        add("llama3_json")
+
+    return candidates
+
+
+def _parse_raw_tool_calls_with_gemma_fallback(
+    text: str, preferred: Optional[str] = None
+) -> tuple[Optional[str], Optional[list]]:
+    """Parse raw tool-call markup, with an inline Gemma fallback.
+
+    In some CLI/runtime contexts the ``environments.tool_call_parsers`` import
+    is unavailable even though the code exists in the repo. When that happens
+    we still want Gemma's raw ``<|tool_call>...`` markup to execute instead of
+    leaking to the user as plain text.
+    """
+
+    def _inline_parse_kwargs(raw: str) -> dict:
+        raw = (raw or "").strip().replace('<|"|>', '"')
+        if not raw:
+            return {}
+        try:
+            parsed = ast.literal_eval("{" + raw + "}")
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        out = {}
+        for part in [p.strip() for p in raw.split(",") if p.strip()]:
+            if ":" not in part:
+                continue
+            key, val = part.split(":", 1)
+            key = key.strip().strip("'\"")
+            val = val.strip()
+            try:
+                out[key] = ast.literal_eval(val)
+            except Exception:
+                out[key] = val.strip("'\"")
+        return out
+
+    def _inline_parse_gemma(text_value: str) -> tuple[Optional[str], Optional[list]]:
+        if "<|tool_call>" not in (text_value or ""):
+            return text_value, None
+        pattern = re.compile(
+            r"<\|tool_call>\s*call\s*:\s*([A-Za-z0-9_.-]+)\{(.*?)\}\s*(?:<tool_call\|>|<\|tool_call\|>)",
+            re.DOTALL,
+        )
+        calls = []
+        for name, raw_args in pattern.findall(text_value or ""):
+            args = _inline_parse_kwargs(raw_args)
+            calls.append(
+                SimpleNamespace(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    type="function",
+                    function=SimpleNamespace(
+                        name=name,
+                        arguments=json.dumps(args, ensure_ascii=False),
+                    ),
+                )
+            )
+        if not calls:
+            return text_value, None
+        content = (text_value or "").split("<|tool_call>", 1)[0].strip() or None
+        return content, calls
+
+    try:
+        from environments.tool_call_parsers import get_parser
+
+        for parser_name in _candidate_raw_tool_parser_names(text, preferred=preferred):
+            try:
+                parsed_content, parsed_calls = get_parser(parser_name).parse(text)
+            except Exception:
+                logger.debug(
+                    "Raw tool-call parser '%s' failed", parser_name, exc_info=True
+                )
+                continue
+            if parsed_calls:
+                return parsed_content, parsed_calls
+
+        if "<|tool_call>" in (text or ""):
+            try:
+                gemma_content, gemma_calls = get_parser("gemma4").parse(text)
+                if gemma_calls:
+                    return gemma_content, gemma_calls
+            except Exception:
+                logger.debug("Gemma4 forced raw tool-call parse failed", exc_info=True)
+
+        return text, None
+    except ModuleNotFoundError:
+        return _inline_parse_gemma(text)
 
 
 def _is_destructive_command(cmd: str) -> bool:
@@ -4599,6 +4779,8 @@ class AIAgent:
             content_parts: list = []
             tool_calls_acc: dict = {}
             tool_gen_notified: set = set()
+            suppress_raw_tool_markup_stream = False
+            raw_tool_markup_carry = ""
             # Ollama-compatible endpoints reuse index 0 for every tool call
             # in a parallel batch, distinguishing them only by id.  Track
             # the last seen id per raw index so we can detect a new tool
@@ -4643,9 +4825,17 @@ class AIAgent:
                 if delta and delta.content:
                     content_parts.append(delta.content)
                     if not tool_calls_acc:
-                        _fire_first_delta()
-                        self._fire_stream_delta(delta.content)
-                        deltas_were_sent["yes"] = True
+                        if not suppress_raw_tool_markup_stream:
+                            visible_delta, raw_tool_markup_carry, found_raw_tool_marker = _split_visible_stream_delta(
+                                delta.content, carry=raw_tool_markup_carry
+                            )
+                            if visible_delta:
+                                _fire_first_delta()
+                                self._fire_stream_delta(visible_delta)
+                                deltas_were_sent["yes"] = True
+                            if found_raw_tool_marker:
+                                raw_tool_markup_carry = ""
+                                suppress_raw_tool_markup_stream = True
                     else:
                         # Tool calls suppress regular content streaming (avoids
                         # displaying chatty "I'll use the tool..." text alongside
@@ -4658,9 +4848,16 @@ class AIAgent:
                         # reasoning display.  Non-reasoning text is harmlessly
                         # suppressed by the CLI's _stream_delta when the stream
                         # box is already closed (tool boundary flush).
-                        if self.stream_delta_callback:
+                        if self.stream_delta_callback and not suppress_raw_tool_markup_stream:
                             try:
-                                self.stream_delta_callback(delta.content)
+                                visible_delta, raw_tool_markup_carry, found_raw_tool_marker = _split_visible_stream_delta(
+                                    delta.content, carry=raw_tool_markup_carry
+                                )
+                                if visible_delta:
+                                    self.stream_delta_callback(visible_delta)
+                                if found_raw_tool_marker:
+                                    raw_tool_markup_carry = ""
+                                    suppress_raw_tool_markup_stream = True
                             except Exception:
                                 pass
 
@@ -4723,8 +4920,27 @@ class AIAgent:
 
             # Build mock response matching non-streaming shape
             full_content = "".join(content_parts) or None
+            if raw_tool_markup_carry and not suppress_raw_tool_markup_stream:
+                _fire_first_delta()
+                self._fire_stream_delta(raw_tool_markup_carry)
+                deltas_were_sent["yes"] = True
+                raw_tool_markup_carry = ""
             mock_tool_calls = None
             has_truncated_tool_args = False
+            if full_content:
+                try:
+                    parsed_content, parsed_calls = _parse_raw_tool_calls_with_gemma_fallback(
+                        full_content
+                    )
+                    if parsed_calls:
+                        full_content = parsed_content
+                        if not tool_calls_acc:
+                            mock_tool_calls = parsed_calls
+                except Exception:
+                    logger.debug(
+                        "Streaming raw tool-call fallback failed",
+                        exc_info=True,
+                    )
             if tool_calls_acc:
                 mock_tool_calls = []
                 for idx in sorted(tool_calls_acc):
@@ -4748,6 +4964,8 @@ class AIAgent:
             effective_finish_reason = finish_reason or "stop"
             if has_truncated_tool_args:
                 effective_finish_reason = "length"
+            elif mock_tool_calls and effective_finish_reason == "stop":
+                effective_finish_reason = "tool_calls"
 
             full_reasoning = "".join(reasoning_parts) or None
             mock_message = SimpleNamespace(
@@ -9111,7 +9329,31 @@ class AIAgent:
                     }
                 elif hasattr(self, "_codex_incomplete_retries"):
                     self._codex_incomplete_retries = 0
-                
+
+                if (
+                    not getattr(assistant_message, "tool_calls", None)
+                    and assistant_message.content
+                    and _contains_raw_tool_markup(assistant_message.content)
+                ):
+                    try:
+                        parsed_content, parsed_calls = _parse_raw_tool_calls_with_gemma_fallback(
+                            assistant_message.content,
+                            preferred=getattr(self, "tool_parser", None),
+                        )
+                        if parsed_calls:
+                            assistant_message.tool_calls = parsed_calls
+                            if parsed_content is not None:
+                                assistant_message.content = parsed_content
+                            logger.debug(
+                                "Raw tool-call fallback extracted %d tool calls",
+                                len(parsed_calls),
+                            )
+                    except Exception:
+                        logger.debug(
+                            "Raw tool-call fallback failed for assistant content",
+                            exc_info=True,
+                        )
+
                 # Check for tool calls
                 if assistant_message.tool_calls:
                     if not self.quiet_mode:
