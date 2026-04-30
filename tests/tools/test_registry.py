@@ -298,6 +298,8 @@ class TestBuiltinDiscovery:
             "tools.code_execution_tool",
             "tools.cronjob_tools",
             "tools.delegate_tool",
+            "tools.discord_button_tool",
+            "tools.discord_reaction_tool",
             "tools.discord_tool",
             "tools.feishu_doc_tool",
             "tools.feishu_drive_tool",
